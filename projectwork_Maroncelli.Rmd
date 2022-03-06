@@ -1,0 +1,946 @@
+---
+title: "R Projectwork CONV1D"
+author: "Antonio Maroncelli"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+
+```{r}
+library(tidyverse)
+library(reticulate)
+library(tensorflow)
+library(keras)
+library(dplyr)
+library(caret)
+library(tfdatasets)
+library(mice)
+library(deepviz)
+library(ROCR)
+library(MLmetrics)
+library(tfruns)
+library(tfestimators)
+library(abind)
+```
+
+```{r}
+library(neochord)
+?neochord
+neochord
+```
+
+```{r}
+# Assegno il mio dataset alla variabile dat_new
+data_new<-neochord
+map_dbl(data_new, ~ is.na(.) %>% mean)
+
+
+```
+
+
+```{r}
+# Controllo quanti records ho con mvr=NA
+data_new_2 <- subset(data_new, technical_error == FALSE)  # considero solo i dati con technical_error == FALSE
+data_new_3 <- dplyr::select(data_new_2, -technical_error) # tolgo la colonna technical_error
+data_new_3 %>%
+  select(mvr,time )%>%
+  table(useNA = "always")
+
+
+```
+
+
+
+
+```{r}
+
+# Sostituisco gli NA con -99 
+data_new_3$annulus_sap<-(replace_na(data_new_3$annulus_sap,-99))
+data_new_3$annulus_sll<-(replace_na(data_new_3$annulus_sll,-99))
+data_new_3$end_systolic<-(replace_na(data_new_3$end_systolic,-99))
+data_new_3$end_diastolic<-(replace_na(data_new_3$end_diastolic,-99))
+data_new_3$ejection_fraction<-(replace_na(data_new_3$ejection_fraction,-99))
+
+#Rimozione dei record con id 130,131,132,134 in quanto questi record hanno mvr=NA al time=6
+data_new_4<-data_new_3[!data_new_3$id %in% c(130, 131,132,134), ]
+
+#Rimoazione dei record con times= 12 e times=24
+data_new_4<-data_new_4[!data_new_4$time %in% c(12,24), ]
+
+
+# metto tutto a double per gestire i dati
+data_new_4 <- data_new_4 %>% mutate(gender = as.double(gender),hr_pre_status = as.double(hr_pre_status), calcification = as.double(calcification), anterior_entry = as.double(anterior_entry),mvr = as.double(mvr))
+
+class(data_new_4)
+data_new_4
+```
+
+
+# Analisi popolazione
+
+```{r}
+media_eta<-mean(data_new_4$age)
+dev_std_eta<-sd(data_new_4$age)
+paste0("età media: ",media_eta)
+paste0("deviazione standard età: ", dev_std_eta)
+
+
+medio_euroscore<-mean(data_new_4$euro_score)
+dev_std_euroscore<-sd(data_new_4$euro_score)
+paste0("euroscore medio: ",medio_euroscore)
+paste0("deviazione standard euroscore: ", dev_std_euroscore)
+
+prova_3<-data_new_4[data_new_4$hr_pre_status %in% c(1), ]
+prova_3<-unique(prova_3$id)
+ritmo_pre_op_sin<-length(prova_3)
+paste0("ritmo sinusale: ", ritmo_pre_op_sin)
+
+prova_4<-data_new_4[data_new_4$hr_pre_status %in% c(2), ]
+prova_4<-unique(prova_4$id)
+ritmo_pre_op_no_sin<-length(prova_4)
+paste0("ritmo non sinusale: ", ritmo_pre_op_no_sin)
+perc_ritmo_sin<-ritmo_pre_op_sin/(ritmo_pre_op_sin+ritmo_pre_op_no_sin)
+paste0("% ritmo sinusale: ", perc_ritmo_sin)
+
+prova2<-data_new_4[data_new_4$gender %in% c(2), ]
+prova2<-unique(prova2$id)
+donne<-length(prova2)
+paste0("n. donne: ", donne)
+
+
+prova1<-data_new_4[data_new_4$gender %in% c(1), ]
+prova1<-unique(prova1$id)
+uomini<-length(prova1)
+paste0("num uomini: ",uomini)
+
+perc_uomini<-uomini/(uomini+donne)
+paste0("percentuale uomini: ",perc_uomini)
+```
+
+
+
+# Creazione di Training e Test
+
+```{r}
+pazienti<-sort(unique(data_new_4$id))
+
+# Suddivisione Train e Test
+num_train=87 # numero di elementi del mio training
+num_test<-length(pazienti)-num_train # numero di elementi del mio test
+
+num_train
+num_test
+```
+
+
+```{r}
+set.seed(1234567)
+
+id_train<-sample(pazienti,num_train,replace=FALSE)  # campiono num_train elementi all'interno di pazienti per selezionare id_train
+id_train<-sort(id_train)
+
+id_test<-setdiff(pazienti,id_train)  # trovo gli id del test facendo la differenza fra pazienti e id_train
+id_test<-sort(id_test)
+
+id_train
+id_test
+
+train_data<-data_new_4[data_new_4$id %in% id_train, ]
+train_data
+
+test_data<-data_new_4[data_new_4$id %in% id_test, ]
+test_data
+```
+
+
+
+```{r}
+# Calcolo la % di mvr=1 nel training
+traindata_mvr_1<-train_data[train_data$mvr %in% c(1), ]
+perc_1_train=dim(traindata_mvr_1)[1]/dim(train_data)[1]
+perc_1_train
+
+```
+
+```{r}
+# Calcolo la % di mvr=1 nel test
+testdata_mvr_1<-test_data[test_data$mvr %in% c(1), ]
+perc_1_test=dim(testdata_mvr_1)[1]/dim(test_data)[1]
+perc_1_test
+```
+
+
+# vedo che le % dell'outcome corrispondono tra training e test 
+
+```{r}
+# controllo la numerosità dei vari time nel training
+
+train0<-train_data$time %in% c(0)
+train0<-length(train0[train0==TRUE])
+paste0("train time 0: ", sprintf("%.2i", train0 ))
+
+
+train1<-train_data$time %in% c(1)
+train1<-length(train1[train1==TRUE])
+paste0("train time 1: ", sprintf("%.2i", train1 ))
+
+
+train3<-train_data$time %in% c(3)
+train3<-length(train3[train3==TRUE])
+paste0("train time 3: ", sprintf("%.2i", train3 ))
+
+
+train6<-train_data$time %in% c(6)
+train6<-length(train6[train6==TRUE])
+paste0("train time 6: ", sprintf("%.2i", train6 ))
+
+tot_train<-train0+train1+train3+train6
+paste0("totale record Training: ", sprintf("%.2i", tot_train ))
+
+```
+
+
+
+```{r}
+# controllo la numerosità dei vari time nel test
+
+test0<-test_data$time %in% c(0)
+test0<-length(test0[test0==TRUE])
+paste0("test time 0: ", sprintf("%.2i", test0 ))
+
+
+test1<-test_data$time %in% c(1)
+test1<-length(test1[test1==TRUE])
+paste0("test time 1: ", sprintf("%.2i", test1 ))
+
+
+test3<-test_data$time %in% c(3)
+test3<-length(test3[test3==TRUE])
+paste0("test time 3: ", sprintf("%.2i", test3 ))
+
+
+test6<-test_data$time %in% c(6)
+test6<-length(test6[test6==TRUE])
+paste0("test time 6: ", sprintf("%.2i", test6 ))
+
+tot_test<-test0+test1+test3+test6
+paste0("totale record Test: ", sprintf("%.2i", tot_test ))
+```
+
+
+
+
+```{r}
+# suddivido il dataset di train nei vari time
+data_0_train<-train_data[train_data$time %in% c(0), ]
+data_1_train<-train_data[train_data$time %in% c(1), ]
+data_3_train<-train_data[train_data$time %in% c(3), ]
+data_6_train<-train_data[train_data$time %in% c(6), ]
+
+
+
+
+# suddivido il dataset di train nei vari time
+data_0_test<-test_data[test_data$time %in% c(0), ]
+data_1_test<-test_data[test_data$time %in% c(1), ]
+data_3_test<-test_data[test_data$time %in% c(3), ]
+data_6_test<-test_data[test_data$time %in% c(6), ]
+
+
+# trovo gli ID del mio training al time 0
+val_id_0_train<-unique(data_0_train$id)
+
+# trovo gli ID del mio training al time 1
+val_id_1_train<-unique(data_1_train$id)
+
+# trovo gli ID del mio training al time 3
+val_id_3_train<-unique(data_3_train$id)
+
+# trovo gli ID del mio training al time 6
+val_id_6_train<-unique(data_6_train$id)
+
+# confronto gli id del mio traing al time 0, time 1, time3, time6
+paste0("confronto id del training al time0, time1, time3 e time6: ")
+val_id_0_train
+val_id_1_train
+val_id_3_train
+val_id_6_train
+
+
+
+
+
+# trovo gli ID del mio test al time 0
+val_id_0_test<-unique(data_0_test$id)
+
+# trovo gli ID del mio test al time 1
+val_id_1_test<-unique(data_1_test$id)
+
+# trovo gli ID del mio test al time 3
+val_id_3_test<-unique(data_3_test$id)
+
+# trovo gli ID del mio test al time 6
+val_id_6_test<-unique(data_6_test$id)
+
+# confronto gli id del mio test al time 0, time 1, time3, time6
+paste0("confronto id del test al time0, time1, time3 e time6: ")
+val_id_0_test
+val_id_1_test
+val_id_3_test
+val_id_6_test
+
+
+
+# creo il nome dei miei ID di train
+name_id_train<-as.character(val_id_0_train)
+name_id_train<-paste("ID",name_id_train,sep="")
+
+# creo il nome dei miei ID di test
+name_id_test<-as.character(val_id_0_test)
+name_id_test<-paste("ID",name_id_test,sep="")
+
+
+# Creo una lista con i nomi da assegnare ai records contenuti nel mio vettore 3D
+dim_names=list(
+name_id_train,
+c("Times0","Times1","Times3","Times6"),
+c("id","age","gender","euro_score","hr_pre_status","pap","annulus_sap","annulus_sll","end_systolic","end_diastolic","ejection_fraction","leaflet_annulus","coaptation","flail","calcification","anterior_entry","neochord_implanted","time","mvr"))
+
+
+
+
+dim_names_test=list(
+name_id_test,
+c("Times0","Times1","Times3","Times6"),
+c("id","age","gender","euro_score","hr_pre_status","pap","annulus_sap","annulus_sll","end_systolic","end_diastolic","ejection_fraction","leaflet_annulus","coaptation","flail","calcification","anterior_entry","neochord_implanted","time","mvr"))
+
+
+
+```
+
+
+# TRAIN
+```{r}
+data_new_6<-array(as.numeric(unlist(train_data)), dim=c(87, 4, 19))  # creo un vettore di train delle dimensioni desiderate
+
+dimnames(data_new_6)<-dim_names # associo al mio vettore di train il nome delle features
+
+data_train<-data_new_6[,,2:17] # separo le features dal outcome
+data_target_train<-data_new_6[,4,19]
+paste0("data_train: ")
+data_train 
+paste0("data_target_train: " )
+data_target_train<-data_target_train-1     # sottraggo 1 per avere come classi 0 e 1
+data_target_train
+```
+
+
+
+
+# TEST
+
+```{r}
+data_new_7<-array(as.numeric(unlist(test_data)), dim=c(20, 4, 19))  # creo un vettore di train delle dimensioni desiderate
+
+dimnames(data_new_7)<-dim_names_test # associo al mio vettore di test il nome delle features
+
+data_test<-data_new_7[,,2:17]  # separo le features dal outcome
+data_target_test<-data_new_7[,4,19]
+paste0("data_test: "  )
+data_test
+paste0("data_target_test: "   )
+data_target_test<-data_target_test-1  # sottraggo 1 per avere come classi 0 e 1
+data_target_test
+```
+
+
+
+
+
+# CROSS VALIDATION
+```{r}
+
+
+array_id<-c(1:dim(data_train)[1])
+
+
+set.seed(567)
+id_folds=createFolds(data_target_train %in% c(1),k=5)  # separo gli id del mio train in 5 gruppi
+id_val_cv1<-id_folds$Fold1 # id di validation del 1 fold
+id_val_cv2<-id_folds$Fold2 # id di validation del 2 fold
+id_val_cv3<-id_folds$Fold3 # id di validation del 3 fold
+id_val_cv4<-id_folds$Fold4 # id di validation del 4 fold
+id_val_cv5<-id_folds$Fold5 # id di validation del 5 fold
+
+# tramite setdiff per ogni fold mi trovo gli id del corrispondente validation
+id_train_cv1<-setdiff(array_id,id_val_cv1) # id di train del 1 fold
+id_train_cv2<-setdiff(array_id,id_val_cv2) # id di train del 2 fold
+id_train_cv3<-setdiff(array_id,id_val_cv3) # id di train del 3 fold
+id_train_cv4<-setdiff(array_id,id_val_cv4) # id di train del 4 fold
+id_train_cv5<-setdiff(array_id,id_val_cv5) # id di train del 5 fold
+
+
+create_train<-function(id_val){
+  id_train<-setdiff(array_id,id_val)
+  id_train<-sort(id_train)
+  kf_train<-data_train[id_train,,]
+}
+create_train_target<-function(id_val){
+  id_train<-setdiff(array_id,id_val)
+  id_train<-sort(id_train)
+  kf_train_target<-data_target_train[id_train]
+}
+create_val<-function(id_val){
+  kf_train<-data_train[id_val,,]
+}
+create_val_target<-function(id_val){
+  kf_train_target<-data_target_train[id_val]
+}
+
+
+kf1_train<-create_train(id_val_cv1)
+kf1_train_target<-create_train_target(id_val_cv1)
+kf1_val<-create_val(id_val_cv1)
+kf1_val_target<-create_val_target(id_val_cv1)
+
+kf2_train<-create_train(id_val_cv2)
+kf2_train_target<-create_train_target(id_val_cv2)
+kf2_val<-create_val(id_val_cv2)
+kf2_val_target<-create_val_target(id_val_cv2)
+
+kf3_train<-create_train(id_val_cv3)
+kf3_train_target<-create_train_target(id_val_cv3)
+kf3_val<-create_val(id_val_cv3)
+kf3_val_target<-create_val_target(id_val_cv3)
+
+kf4_train<-create_train(id_val_cv4)
+kf4_train_target<-create_train_target(id_val_cv4)
+kf4_val<-create_val(id_val_cv4)
+kf4_val_target<-create_val_target(id_val_cv4)
+
+kf5_train<-create_train(id_val_cv5)
+kf5_train_target<-create_train_target(id_val_cv5)
+kf5_val<-create_val(id_val_cv5)
+kf5_val_target<-create_val_target(id_val_cv5)
+
+```
+
+
+
+
+
+
+# Controllo le percentuali di mvr nei vari folds
+```{r}
+val1<-kf1_val_target %in% c(1)
+val1<-length(val1[val1==TRUE])
+paste0("val kf1: ", sprintf("%.2i", val1 ))
+
+val2<-kf2_val_target %in% c(1)
+val2<-length(val2[val2==TRUE])
+paste0("val kf2: ", sprintf("%.2i", val2 ))
+
+val3<-kf3_val_target %in% c(1)
+val3<-length(val3[val3==TRUE])
+paste0("val kf3: ", sprintf("%.2i", val3 ))
+
+val4<-kf4_val_target %in% c(1)
+val4<-length(val4[val4==TRUE])
+paste0("val kf4: ", sprintf("%.2i", val4 ))
+
+val5<-kf5_val_target %in% c(1)
+val5<-length(val5[val5==TRUE])
+paste0("val kf5: ", sprintf("%.2i", val5 ))
+```
+
+# Guardo il target dei Folds
+```{r}
+kf1_val_target
+kf2_val_target
+kf3_val_target
+kf4_val_target
+kf5_val_target
+```
+
+
+
+
+# Creazione del modello per la cross validazione
+```{r}
+build_model_conv1d_mod <- function(input_shape = c(NULL,3,16), num_classes = 2,drop_out,conv1,conv2,neurons1,neurons2) {
+
+  
+  inputs <- layer_input(shape = input_shape,name = "Input_Layer")
+    conv1 <- inputs %>%
+        layer_conv_1d(
+              filters = conv1, 
+              strides = 2,
+              kernel_size = 2,
+              padding = "causal",
+              activation = "relu",
+              kernel_initializer="he_uniform",
+              name = "Conv1D-1") %>%
+        layer_batch_normalization(name = "Normalization1") %>%
+        layer_dropout(drop_out, name = "Dropout1") #%>%
+
+    
+    conv2 <- conv1 %>%
+        layer_conv_1d(
+              filters = conv2, #1
+              strides = 2,
+              kernel_size = 2,
+              padding = "causal",
+              activation = "relu",
+              kernel_initializer="he_uniform",
+              name = "Conv1D-2") %>%
+        layer_batch_normalization(name = "Normalization2") %>%
+        layer_dropout(drop_out, name = "Dropout2") #%>%
+     
+    output2 <- conv2
+  
+  # Fully Connected Model
+  output <- output2 %>%
+    layer_flatten() %>%
+    layer_dense(units = neurons1, activation = "relu") %>%
+    layer_dense(units = neurons2, activation = "relu") %>%
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  model<-keras_model(inputs,output)
+  
+  model %>% compile(
+    optimizer = optimizer_adam(),
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
+  
+}
+```
+
+
+# Addestramento del modello per la cross validazione
+```{r}
+train_model_conv1d_mod <- function(model,kf_train, kf_train_target, kf_val,kf_val_target, kf_epochs){
+  set.seed(42)
+  train_history_conv1d_1 <- model %>% fit(
+    x=kf_train[,1:3,],
+    y=kf_train_target,
+    epochs = kf_epochs,
+    validation_data=list(kf_val[,1:3,],kf_val_target))
+
+    predicted.classes_conv1d<-model%>%predict(kf_val[,1:3,],probability=TRUE)
+    predizione <- prediction( predicted.classes_conv1d,as.integer(kf_val_target ))
+    risultato <- performance( predizione , "sens", "spec")
+
+    AUC<-performance(predizione, "auc")@y.values[[1]]
+    
+}
+```
+
+
+
+# Tuning Parametri 
+
+```{r}
+
+dropout = c(0.5,0.3)
+conv1 = c(64,128)
+epochs = c(200)
+
+AUC_1<-c()
+AUC_2<-c()
+AUC_3<-c()
+AUC_4<-c()
+AUC_5<-c()
+media_AUC<-c()
+
+# creazione griglia con parametri da cross validare
+grid<-expand.grid(dropout=dropout,conv1=conv1,epochs=epochs)
+grid<-grid[2:3,]
+
+comb<-dim(grid)[1]
+# ciclo for che itera tutte le combinazione della griglia
+for(i in 1:comb){
+  model1<-build_model_conv1d_mod(drop_out=grid$dropout[i],conv1=grid$conv1[i],conv2=2*grid$conv1[i],neurons1 = 2*grid$conv1[i], neurons2 = 2*grid$conv1[i])
+  AUC_1[i]<-train_model_conv1d_mod(model=model1,kf_train=kf1_train, kf_train_target=kf1_train_target, kf_val=kf1_val,kf_val_target=kf1_val_target, kf_epochs=grid$epochs[i]) # calcolo AUC per il 1 folds
+  model2<-build_model_conv1d_mod(drop_out=grid$dropout[i],conv1=grid$conv1[i],conv2=2*grid$conv1[i],neurons1 = 2*grid$conv1[i], neurons2 = 2*grid$conv1[i])
+  AUC_2[i]<-train_model_conv1d_mod(model=model2,kf_train=kf2_train, kf_train_target=kf2_train_target, kf_val=kf2_val,kf_val_target=kf2_val_target, kf_epochs=grid$epochs[i]) # calcolo AUC per il 2 folds
+  model3<-build_model_conv1d_mod(drop_out=grid$dropout[i],conv1=grid$conv1[i],conv2=2*grid$conv1[i],neurons1 = 2*grid$conv1[i], neurons2 = 2*grid$conv1[i])
+  AUC_3[i]<-train_model_conv1d_mod(model=model3,kf_train=kf3_train, kf_train_target=kf3_train_target, kf_val=kf3_val,kf_val_target=kf3_val_target, kf_epochs=grid$epochs[i]) # calcolo AUC per il 3 folds
+  model4<-build_model_conv1d_mod(drop_out=grid$dropout[i],conv1=grid$conv1[i],conv2=2*grid$conv1[i],neurons1 = 2*grid$conv1[i], neurons2 = 2*grid$conv1[i])
+  AUC_4[i]<-train_model_conv1d_mod(model=model4,kf_train=kf4_train, kf_train_target=kf4_train_target, kf_val=kf4_val,kf_val_target=kf4_val_target, kf_epochs=grid$epochs[i]) # calcolo AUC per il 4 folds
+  model5<-build_model_conv1d_mod(drop_out=grid$dropout[i],conv1=grid$conv1[i],conv2=2*grid$conv1[i],neurons1 = 2*grid$conv1[i], neurons2 = 2*grid$conv1[i])
+  AUC_5[i]<-train_model_conv1d_mod(model=model5,kf_train=kf5_train, kf_train_target=kf5_train_target, kf_val=kf5_val,kf_val_target=kf5_val_target, kf_epochs=grid$epochs[i]) # calcolo AUC per il 5 folds
+  media_AUC[i]<-mean(c(AUC_1[i],AUC_2[i],AUC_3[i],AUC_4[i],AUC_5[i])) # calcolo media delle AUC nei 5 folds per la singola combinazione di paramtri
+}
+
+
+
+AUC_max<-max(media_AUC) # trovo AUC massima
+AUC_max
+
+
+indice<-which(media_AUC == AUC_max) # indice relativo ad AUC massima
+indice
+
+dropout_best<-grid$dropout[indice] # dropout relativo ad AUC massima
+conv1_best<-grid$conv1[indice] # numero filtri 1 blocco convoluzionale relativo ad AUC massima
+conv2_best<-2*conv1_best # numero filtri 2 blocco convoluzionale relativo ad AUC massima
+neurons1_best<-conv2_best # numero neuroni 1 strato fully connect
+neurons2_best<-neurons1_best # numero neuroni 2 strato fully connect
+
+
+
+dropout_best
+conv1_best
+conv2_best
+neurons1_best
+neurons2_best
+
+save(dropout_best,conv1_best,conv2_best,neurons1_best,neurons2_best, file = "cv.RData") # salvo i parametri migliori in un file
+```
+
+
+
+
+# Creazione Modello stand alone con parametri post cross-validazione
+
+```{r}
+build_model_conv1d <- function(input_shape = c(NULL,3,16), num_classes = 2, drop_out, conv1, conv2, neu1, neu2) {
+
+    
+    inputs <- layer_input(shape = input_shape,name = "Input_Layer")
+    conv1 <- inputs %>%
+        layer_conv_1d(
+              filters = conv1, #1
+              strides = 2,
+              kernel_size = 2,
+              padding = "causal",
+              activation = "relu",
+              kernel_initializer="he_uniform",
+              name = "Conv1D-1") %>%
+        layer_batch_normalization(name = "Normalization1") %>%
+        layer_dropout(drop_out, name = "Dropout1") #%>%
+
+    
+    conv2 <- conv1 %>%
+        layer_conv_1d(
+              filters = conv2, #1
+              strides = 2,
+              kernel_size = 2,
+              padding = "causal",
+              activation = "relu",
+              kernel_initializer="he_uniform",
+              name = "Conv1D-2") %>%
+        layer_batch_normalization(name = "Normalization2") %>%
+        layer_dropout(drop_out, name = "Dropout2") #%>%
+     
+    output2 <- conv2
+  
+    
+    # Fully Connected Model
+    output <- output2 %>% 
+        layer_flatten(name = "Flatten_Layer") %>%
+        layer_dense(units = neu1, activation = "relu",kernel_initializer="he_uniform",  name = "Dense_Layer1") %>%
+        layer_dense(units = neu2, activation = "relu",kernel_initializer="he_uniform", name = "Dense_Layer2") %>%
+        layer_dense(units = 1, activation = "sigmoid",kernel_initializer="he_uniform", name = "Output") 
+    
+    model<-keras_model(inputs,output)
+    summary(model)
+    
+    model %>% compile(
+          optimizer = optimizer_adam(),
+          loss = "binary_crossentropy",
+          metrics = c("accuracy")
+      )
+    
+   
+}
+```
+
+
+
+
+
+
+# ADDESTRAMENTO MODELLO
+
+```{r}
+
+model<-build_model_conv1d(drop_out=dropout_best, conv1=conv1_best, conv2=conv2_best, neu1=neurons1_best, neu2=neurons2_best)
+
+set.seed(42)
+train_history_conv1d <- model %>% fit(
+  x=data_train[,1:3,],
+  y=data_target_train,
+  epochs = 200,
+  validation_data=list(data_test[,1:3,],data_target_test))
+
+
+plot(train_history_conv1d)
+
+```
+
+
+# Predizione Test
+
+```{r}
+set.seed(142)
+predicted.classes_conv1d<-model%>%predict(data_test[,1:3,],probability=TRUE)
+predicted.classes_conv1d
+
+```
+
+
+
+
+
+# CURVA ROC
+
+```{r}
+# Pacchetto ROCR
+predizione <- prediction( predicted.classes_conv1d,data_target_test )
+risultato <- performance( predizione , "sens", "spec")
+plot(risultato , colorize=TRUE , main = "CURVA ROC")
+
+```
+
+
+```{r}
+
+# Funzione che avvicina maggiormente (in termini di distanza)
+#all'angolo in alto a destra del grafico per massimizzare specificità e sensibilità
+
+migliorecutoff <- function(perf)
+{Posizione_cut_off = which((risultato@x.values[[1]]-
+risultato@y.values[[1]])==min((risultato@x.values[[1]]-
+risultato@y.values[[1]])[risultato@x.values[[1]]-risultato@y.values[[1]]>0]))
+return(risultato@alpha.values[[1]][Posizione_cut_off]) }
+```
+
+```{r}
+cut_off<-migliorecutoff()
+paste0("Cut off: ",cut_off)
+
+# AUC = Area sotto la curva ROC
+AUC<-performance(predizione, "auc")@y.values[[1]]
+paste0("AUC: ",AUC)
+
+
+# # seguendo la scala di Swets 
+# 
+# # AUC = 0.5 non informativo
+# # 0.5 < AUC < 0.7 poco accurato
+# # 0.7 < AUC < 0.9 moderatamente accurato
+# # 0.9 < AUC < 1 altamente accurato
+# # AUC = 1 Perfetto
+# 
+```
+
+
+
+# Confusion Matrix
+
+```{r}
+predicted.classes_conv1d_2 <- ifelse(predicted.classes_conv1d >= cut_off	 , 1, 0)       # ho settato la soglia per ottenere sensibilità 1
+predicted.classes_conv1d_2<-as.numeric(predicted.classes_conv1d_2)
+data_target_test<-as.numeric(data_target_test)
+
+
+cm<-confusionMatrix(as.factor(predicted.classes_conv1d_2),as.factor(data_target_test), positive = "1")   
+cm
+cm$byClass
+
+```
+
+
+
+# RIPETIZIONE Addestramento
+```{r}
+sensitivity_r<-c()
+specificity_r<-c()
+pos_pred_value_r<-c()
+neg_pred_vale_r<-c()
+precision_r<-c()
+recal_r<-c()
+f1_r<-c()
+prevalence_r<-c()
+detection_rate<-c()
+detection_prevalence<-c()
+balanced_accuracy<-c()
+AUC_RIP<-c()
+numrip<-30
+
+for(i in seq_len(numrip)){
+ 
+  model<-build_model_conv1d(drop_out=dropout_best,conv1=conv1_best, conv2=conv2_best, neu1=neurons1_best, neu2=neurons2_best)
+  train_history_conv1d <- model %>% fit(
+    x=data_train[,1:3,],
+    y=data_target_train,
+    epochs = 200,
+    validation_data=list(data_test[,1:3,],data_target_test))
+
+  predicted.classes_conv1d<-model%>%predict(data_test[,1:3,],probability=TRUE)
+  predizione <- prediction( predicted.classes_conv1d,data_target_test )
+  risultato <- performance( predizione , "sens", "spec")
+  cut_off<-migliorecutoff()
+  AUC<-performance(predizione, "auc")@y.values[[1]]
+  predicted.classes_conv1d_2 <- ifelse(predicted.classes_conv1d >= cut_off	 , 1, 0)       # ho settato la soglia per ottenere sensibilità 1
+  predicted.classes_conv1d_2<-as.numeric(predicted.classes_conv1d_2)
+  data_target_test<-as.numeric(data_target_test)
+  cm<-confusionMatrix(as.factor(predicted.classes_conv1d_2),as.factor(data_target_test), positive = "1")   
+  
+  sensitivity_r[[length(sensitivity_r)+1]]<-cm$byClass[1]
+  specificity_r[[length(specificity_r)+1]]<-cm$byClass[2]
+  pos_pred_value_r[[length(pos_pred_value_r)+1]]<-cm$byClass[3]
+  neg_pred_vale_r[[length(neg_pred_vale_r)+1]]<-cm$byClass[4]
+  precision_r[[length(precision_r)+1]]<-cm$byClass[5]
+  recal_r[[length(recal_r)+1]]<-cm$byClass[6]
+  f1_r[[length(f1_r)+1]]<-cm$byClass[7]
+  prevalence_r[[length(prevalence_r)+1]]<-cm$byClass[8]
+  detection_rate[[length(detection_rate)+1]]<-cm$byClass[9]
+  detection_prevalence[[length(detection_prevalence)+1]]<-cm$byClass[numrip]
+  balanced_accuracy[[length(balanced_accuracy)+1]]<-cm$byClass[11]
+  AUC_RIP[[length(AUC_RIP)+1]]<-AUC
+}
+
+sensitivity_r<-as.numeric(sensitivity_r)
+specificity_r<-as.numeric(specificity_r)
+pos_pred_value_r<-as.numeric(pos_pred_value_r)
+neg_pred_vale_r<-as.numeric(neg_pred_vale_r)
+precision_r<-as.numeric(precision_r)
+recal_r<-as.numeric(recal_r)
+f1_r<-as.numeric(f1_r)
+prevalence_r<-as.numeric(prevalence_r)
+detection_rate<-as.numeric(detection_rate)
+detection_prevalence<-as.numeric(detection_prevalence)
+balanced_accuracy<-as.numeric(balanced_accuracy)
+AUC_RIP<-as.numeric(AUC_RIP)
+
+
+mean_AUC<-mean(AUC_RIP)
+std_AUC<-sd(AUC_RIP)
+interval_AUC<-std_AUC*1.96
+lower_interval_AUC<-mean_AUC-interval_AUC
+upper_interval_AUC<-mean_AUC+interval_AUC
+
+plot(y=AUC_RIP,x=1:numrip,xlab="Ripetition", ylab="AUC",col="red", ylim=c(min(AUC_RIP)-0.5,max(AUC_RIP)+0.5))+
+lines(y=rep(upper_interval_AUC,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_AUC,numrip),x=1:numrip, col="blue")
+
+
+mean_sensitivity <- mean(sensitivity_r)
+std_sensitivity <- sd(sensitivity_r)
+interval_sensitivity<-std_sensitivity*1.96
+lower_interval_sensitivity<-mean_sensitivity-interval_sensitivity
+upper_interval_sensitivity<-mean_sensitivity+interval_sensitivity
+
+plot(y=sensitivity_r,x=1:numrip,xlab="Ripetition", ylab="Sensitivity",col="red", ylim=c(min(sensitivity_r)-0.5,max(sensitivity_r)+0.5))+
+lines(y=rep(upper_interval_sensitivity,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_sensitivity,numrip),x=1:numrip, col="blue")
+  
+
+mean_specificity <- mean(specificity_r)
+std_specificity <- sd(specificity_r)
+interval_specificity<-std_specificity*1.96
+lower_interval_specificity<-mean_specificity-interval_specificity
+upper_interval_specificity<-mean_specificity+interval_specificity
+
+plot(y=specificity_r,x=1:numrip,xlab="Ripetition", ylab="Specificity", col="red", ylim=c(min(specificity_r)-0.5,max(specificity_r)+0.5))+
+lines(y=rep(upper_interval_specificity,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_specificity,numrip),x=1:numrip, col="blue")
+
+
+mean_pos_pred_value <- mean(pos_pred_value_r)
+std_pos_pred_value <- sd(pos_pred_value_r)
+interval_pos_pred_value<-std_pos_pred_value*1.96
+lower_interval_pos_pred_value<-mean_pos_pred_value-interval_pos_pred_value
+upper_interval_pos_pred_value<-mean_pos_pred_value+interval_pos_pred_value
+
+plot(y=pos_pred_value_r,x=1:numrip,xlab="Ripetition", ylab="Pos pred Value", col="red", ylim=c(min(pos_pred_value_r)-0.5,max(pos_pred_value_r)+0.5))+
+lines(y=rep(upper_interval_pos_pred_value,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_pos_pred_value,numrip),x=1:numrip, col="blue")
+
+
+mean_neg_pred_value <- mean(neg_pred_vale_r)
+std_neg_pred_value <- sd(neg_pred_vale_r)
+interval_neg_pred_value<-std_neg_pred_value*1.96
+lower_interval_neg_pred_value<-mean_neg_pred_value-interval_neg_pred_value
+upper_interval_neg_pred_value<-mean_neg_pred_value+interval_neg_pred_value
+
+plot(y=neg_pred_vale_r,x=1:numrip,xlab="Ripetition", ylab="Neg pred Value", col="red", ylim=c(min(neg_pred_vale_r)-0.5,max(neg_pred_vale_r)+0.5))+
+lines(y=rep(upper_interval_neg_pred_value,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_neg_pred_value,numrip),x=1:numrip, col="blue")
+
+
+mean_precision <- mean(precision_r)
+std_precision <- sd(precision_r)
+interval_precision<-std_precision*1.96
+lower_interval_precision<-mean_precision-interval_precision
+upper_interval_precision<-mean_precision+interval_precision
+
+plot(y=precision_r,x=1:numrip,xlab="Ripetition", ylab="Precision", col="red", ylim=c(min(precision_r)-0.5,max(precision_r)+0.5))+
+lines(y=rep(upper_interval_precision,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_precision,numrip),x=1:numrip, col="blue")
+
+
+mean_recal <- mean(recal_r)
+std_recal <- sd(recal_r)
+interval_recal<-std_recal*1.96
+lower_interval_recal<-mean_recal-interval_recal
+upper_interval_recal<-mean_recal+interval_recal
+
+plot(y=recal_r,x=1:numrip,xlab="Ripetition", ylab="Recal", col="red", ylim=c(min(recal_r)-0.5,max(recal_r)+0.5))+
+lines(y=rep(upper_interval_recal,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_recal,numrip),x=1:numrip, col="blue")
+
+
+mean_f1 <- mean(f1_r)
+std_f1 <- sd(f1_r)
+interval_f1<-std_f1*1.96
+lower_interval_f1<-mean_f1-interval_f1
+upper_interval_f1<-mean_f1+interval_f1
+
+plot(y=f1_r,x=1:numrip,xlab="Ripetition", ylab="F1", col="red", ylim=c(min(f1_r)-0.5,max(f1_r)+0.5))+
+lines(y=rep(upper_interval_f1,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_f1,numrip),x=1:numrip, col="blue")
+
+
+mean_balanced_accuracy <- mean(balanced_accuracy)
+std_balanced_accuracy <- sd(balanced_accuracy)
+interval_balanced_accuracy<-std_balanced_accuracy*1.96
+lower_interval_balanced_accuracy<-mean_balanced_accuracy-interval_balanced_accuracy
+upper_interval_balanced_accuracy<-mean_balanced_accuracy+interval_balanced_accuracy
+
+plot(y=balanced_accuracy,x=1:numrip,xlab="Ripetition", ylab="Balance Accuracy", col="red", ylim=c(min(balanced_accuracy)-0.5,max(balanced_accuracy)+0.5))+
+lines(y=rep(upper_interval_balanced_accuracy,numrip),x=1:numrip, col="blue")+
+lines(y=rep(lower_interval_balanced_accuracy,numrip),x=1:numrip, col="blue")
+
+
+
+
+
+
+
+
+
+paste0("AUC media ",mean_AUC, " dopo ", numrip, " ripetizioni")
+
+paste0("Sensibilità media ",mean_sensitivity, " dopo ", numrip, " ripetizioni")
+
+paste0("Specificità media ",mean_specificity, " dopo ", numrip, " ripetizioni")
+
+paste0("Accuratezza bilanciata ",mean_balanced_accuracy, " dopo ", numrip, " ripetizioni")
+
+paste0("Precisione media ",mean_precision, " dopo ", numrip, " ripetizioni")
+
+paste0("F1 media ",mean_f1, " dopo ", numrip, " ripetizioni")
+
+paste0("Valore predittivo positivo medio ",mean_pos_pred_value, " dopo ", numrip, " ripetizioni")
+
+paste0("Valore predittivo negativo medio ",mean_neg_pred_value, " dopo ", numrip, " ripetizioni")
+
+
+```
+
+
